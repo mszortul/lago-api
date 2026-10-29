@@ -1,0 +1,133 @@
+# Does Lago v1.55.0 work on PostgreSQL 18 without pg_partman, the way tvgraf would run it?
+#
+# Lago's own CI uses getlago/postgres-partman:15 and loads db/structure.sql, which needs pg_partman.
+# In production Lago runs `rails db:migrate`, whose migrations skip partman when it is missing, so
+# here the database is always built by migrations on a plain postgres image. PostgreSQL 15 runs
+# beside 18 as the control: a test that fails on both is not about the version.
+name: PostgreSQL version check
+on:
+  push:
+    branches:
+      - "pg18-check"
+  workflow_dispatch:
+permissions: {}
+
+env:
+  RAILS_ENV: test
+  DATABASE_URL: "postgres://lago:lago@localhost:5432/lago"
+  RAILS_MASTER_KEY: N+XcWoGDzKjuoxrU8BIPN5D0/GSuqx9s
+  SECRET_KEY_BASE: cvIAI6ycC0OnVDRAjT5hmbRxnjCxl4YB
+  ENCRYPTION_PRIMARY_KEY: 5I9mjfzry2P787x4S5ZuDdJwXNgYEwqo
+  ENCRYPTION_DETERMINISTIC_KEY: SGiZzmh18EjBF9gSW8LCNk7pelauWVr4
+  ENCRYPTION_KEY_DERIVATION_SALT: q3pkMw34ZkRPFSf2LmtWe705yw532Pf7
+  LAGO_API_URL: https://api.lago.dev
+  LAGO_PDF_URL: https://pdf.lago.dev
+  LAGO_DATA_API_URL: http://data_api
+  LAGO_FROM_EMAIL: noreply@getlago.com
+  LAGO_REDIS_CACHE_URL: "redis://localhost:6379"
+  LAGO_REDIS_STORE_URL: "localhost:6379"
+  LAGO_CLICKHOUSE_ENABLED: true
+  LAGO_CLICKHOUSE_MIGRATIONS_ENABLED: true
+  LAGO_CLICKHOUSE_HOST: localhost
+  LAGO_CLICKHOUSE_DATABASE: default
+  LAGO_CLICKHOUSE_USERNAME: ""
+  LAGO_CLICKHOUSE_PASSWORD: "password"
+  LAGO_KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+  LAGO_KAFKA_ACTIVITY_LOGS_TOPIC: activity_logs
+  LAGO_KAFKA_API_LOGS_TOPIC: api_logs
+  LAGO_KAFKA_EVENTS_CHARGED_IN_ADVANCE_TOPIC: events_charged_in_advance
+  LAGO_KAFKA_REALTIME_USAGE_TRIGGERS_TOPIC: realtime_usage_triggers
+  LAGO_KAFKA_SECURITY_LOGS_TOPIC: security_logs
+  # The migrations must not rewrite db/structure.sql: it is the partman one, and is not used here.
+  LAGO_DISABLE_SCHEMA_DUMP: true
+  ANNOTATERB_SKIP_ON_DB_TASKS: 1
+  MISTRAL_API_KEY: ""
+  MISTRAL_AGENT_ID: ""
+
+jobs:
+  migrations:
+    name: Migrations on PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "18"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}-alpine
+        ports:
+          - "5432:5432"
+        env:
+          POSTGRES_DB: lago
+          POSTGRES_USER: lago
+          POSTGRES_PASSWORD: lago
+      redis:
+        image: redis:7-alpine
+        ports:
+          - "6379:6379"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0.6"
+          bundler-cache: true
+      - name: Generate RSA keys
+        run: ./scripts/generate.rsa.sh
+      - name: Every migration from an empty database
+        run: bin/rails db:migrate:primary
+      - name: What was made
+        run: |
+          psql "$DATABASE_URL" -Atc "select version()"
+          psql "$DATABASE_URL" -Atc "select extname || ' ' || extversion from pg_extension order by 1"
+          psql "$DATABASE_URL" -Atc "select count(*) || ' tables' from information_schema.tables where table_schema = 'public'"
+          psql "$DATABASE_URL" -Atc "select count(*) || ' migrations' from schema_migrations"
+
+  spec:
+    name: Specs on PostgreSQL ${{ matrix.pg }} (${{ matrix.group }}/10)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "18"]
+        group: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}-alpine
+        ports:
+          - "5432:5432"
+        env:
+          POSTGRES_DB: lago
+          POSTGRES_USER: lago
+          POSTGRES_PASSWORD: lago
+      redis:
+        image: redis:7-alpine
+        ports:
+          - "6379:6379"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0.6"
+          bundler-cache: true
+      - name: Start Clickhouse database
+        run: |
+          docker run -d --rm -p 8123:8123 -p 9000:9000 --ulimit nofile=262144:262144 -v ./clickhouse-s3:/var/lib/clickhouse-s3 -v ./ci/clickhouse/config.xml:/etc/clickhouse-server/config.d/config.xml -e CLICKHOUSE_PASSWORD=password clickhouse/clickhouse-server:25.12-alpine
+      - name: Generate RSA keys
+        run: ./scripts/generate.rsa.sh
+      - name: Database by migrations, not by structure.sql
+        run: bin/rails db:migrate:primary
+      - name: Set up Clickhouse database schema
+        run: bin/rails db:migrate:clickhouse
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Install pdfcpu
+        run: |
+          go install github.com/pdfcpu/pdfcpu/cmd/pdfcpu@v0.16.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Run tests
+        run: bundle exec parallel_rspec --only-group "${{ matrix.group }}" -n 10 --exclude-pattern "spec/integration/.*_integration_spec.rb"
+        continue-on-error: true
+      - name: Retry failed tests
+        run: bundle exec rspec --only-failures
